@@ -1,3 +1,20 @@
+
+
+
+"""
+I made this python script with the intention of using it as a reference for the javascript version
+
+The javascript version is in main.html, but the python version is being left here as legacy
+
+This file is not a dependency of the main.html & can be safely deleted
+
+But it reminds me of the python games that i started coding with in the past, so its just here.
+"""
+
+
+
+
+
 import os
 import webbrowser
 
@@ -88,7 +105,7 @@ def game():
     # Create a temporary HTML file
     file_name = "main.html"
     file_path = os.path.abspath(file_name)
-    webbrowser.open(f"file://{file_path}?live=${live}?blank=${blank}")
+    webbrowser.open(f"file://{file_path}?live={live}&blank={blank}")
 
 
 

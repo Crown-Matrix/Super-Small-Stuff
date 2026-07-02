@@ -7,7 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
-<script src="./main.js"></script>
 <style>
   :root {
     --bg: #0a0908;
@@ -430,9 +429,147 @@
 
   document.getElementById('done-view').addEventListener('click', continueLoop);
 
-  // ---------- Example listeners (safe to delete — for reference only) ----------
-  // document.addEventListener('next', function (e) { console.log('next:', e.detail); });
-  // document.addEventListener('phone-call', function (e) { console.log('phone-call:', e.detail); });
+  //gamelogic code//d
+  
+// JS has no built-in ValueError, so this small subclass mirrors Python's
+// exception type/message for anyone who wants to catch it specifically
+// (e.g. `err instanceof ValueError` or `err.name === "ValueError"`).
+class ValueError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ValueError";
+  }
+}
+
+class Shell {
+  constructor(state) {
+    this.state = state;
+  }
+}
+
+class Game {
+  constructor(live, blank) {
+    this.live = live;
+    this.blank = blank;
+    this.livesFired = 0;
+    this.blanksFired = 0;
+    this.current_index = 0;
+    this.magazine = Array.from(
+      { length: this.live + this.blank },
+      () => new Shell(null)
+    );
+  }
+
+  PhoneCall(index, status) {
+    this.magazine[index].state = status;
+  }
+
+  current_shell() {
+    return this.magazine[this.current_index];
+  }
+
+  LiveProbability() {
+    let potential_lives = this.live - this.livesFired;
+    let potential_blanks = this.blank - this.blanksFired;
+
+    // to consider any past phone calls
+    if (this.current_shell().state === "live") {
+      return 1.0;
+    } else if (this.current_shell().state === "blank") {
+      return 0.0;
+    }
+
+    // to consider any future phone calls
+    // NOTE: .slice(current_index, -1) matches Python's magazine[current_index:-1]
+    // exactly, including the fact that it excludes the very last shell in the
+    // magazine from consideration. Kept as-is for exact logic parity.
+    for (const shell of this.magazine.slice(this.current_index, -1)) {
+      const shell_state = shell.state;
+      if (shell_state === "live") {
+        potential_lives -= 1;
+      } else if (shell_state === "blank") {
+        potential_blanks -= 1;
+      } else {
+        continue;
+      }
+    }
+
+    return potential_lives + potential_blanks > 0
+      ? potential_lives / (potential_lives + potential_blanks)
+      : "Error";
+  }
+
+  nextRound(roundState = null) {
+    this.current_shell(); // no-op call, kept to mirror the original exactly
+
+    if (roundState === null && this.current_shell().state === null) {
+      throw new ValueError("No round state provided");
+    } else if (roundState === null && this.current_shell().state !== null) {
+      roundState = this.current_shell().state;
+    } else if (
+      roundState !== this.current_shell().state &&
+      roundState !== null &&
+      this.current_shell().state !== null
+    ) {
+      throw new ValueError("Round state does not match the current shell state");
+    }
+
+    if (roundState === "live") {
+      this.livesFired += 1;
+    } else if (roundState === "blank") {
+      this.blanksFired += 1;
+    } else {
+      throw new ValueError("Invalid round state. Must be 'live' or 'blank'.");
+    }
+
+    this.current_index += 1;
+  }
+}
+
+const urlParams = new URLSearchParams(window.location.search);
+let live_query = 0;
+let blank_query = 0;
+live_query = parseInt(urlParams.get('live')); 
+blank_query = parseInt(urlParams.get('blank'));
+
+if (isNaN(live_query) || isNaN(blank_query) || live_query < 0 || blank_query < 0) {
+  alert("Invalid query parameters. Please provide non-negative integers for 'live' and 'blank'.");
+  throw new ValueError("Invalid query parameters.");
+  //example url: http://localhost:6767/main.html?live=3&blank=2
+}
+
+
+
+function updatePercentages() {
+  LIVE_PERCENTAGE = Math.round(this_game.LiveProbability() * 100);
+  BLANK_PERCENTAGE = 100 - LIVE_PERCENTAGE;
+}
+//init game object
+var this_game = new Game(live_query, blank_query);
+//init initial scores for display
+updatePercentages();
+
+
+document.addEventListener('next', function (e) {
+  const result = e.detail; // "live" | "miss" | null
+  if (result === "live") {
+    this_game.nextRound("live");
+  } else if (result === "miss") {
+    this_game.nextRound("blank");
+  } else if (result === null) {
+    this_game.nextRound();
+  } else {
+    console.error("Invalid result for 'next' event:", result);
+  }
+  updatePercentages();
+});
+
+document.addEventListener('phone-call', function (e) {
+  const { number, result } = e.detail; // { number: <integer>, result: "live" | "blank" }
+  this_game.PhoneCall(number, result);
+  updatePercentages();
+});
+
 </script>
 </body>
 </html>
