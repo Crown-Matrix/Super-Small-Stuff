@@ -15,10 +15,6 @@ But it reminds me of the python games that i started coding with in the past, so
 
 
 
-import os
-import webbrowser
-
-
 class Shell:
     def __init__(self, state: None):
         self.state = state
@@ -95,19 +91,11 @@ def game():
 
     #at this point live and blank have been set to valid integers for the game instance
 
-
-
     game_instance = Game(live, blank)
 
     #begin REPL console for the game
-    
 
-    # Create a temporary HTML file
-    file_name = "main.html"
-    file_path = os.path.abspath(file_name)
-    webbrowser.open(f"file://{file_path}?live={live}&blank={blank}")
+    #im just gonna do this part in javascript
 
 
-
-
-game()
+#game()
