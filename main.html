@@ -162,8 +162,7 @@
     color: var(--live);
     background: var(--live-bg);
   }
-  .choice-btn[data-value="blank"].selected,
-  .choice-btn[data-value="miss"].selected {
+  .choice-btn[data-value="blank"].selected {
     border-color: var(--blank);
     color: var(--blank);
     background: var(--blank-bg);
@@ -243,16 +242,17 @@
     <button class="btn" id="btn-next">Next</button>
     <button class="btn" id="btn-phone">Phone Call</button>
     <button class="btn" id="btn-view">View</button>
+    <button class="btn" id="btn-new-round">New Round</button>
   </div>
 
-  <!-- Next: conditional live/miss input -->
+  <!-- Next: conditional live/blank input -->
   <div class="panel" id="panel-next">
-    <button class="back-link" data-back>‹ Back</button>
+    <button class="back-link" data-back>< Back</button>
     <div>
       <span class="field-label">Result</span>
       <div class="choice-row">
         <button class="choice-btn" data-value="live">Live</button>
-        <button class="choice-btn" data-value="miss">Miss</button>
+        <button class="choice-btn" data-value="blank">Blank</button>
       </div>
     </div>
     <button class="primary-btn" id="confirm-next" disabled>Log Result</button>
@@ -289,20 +289,34 @@
   </div>
 </div>
 
+<div class="panel" id="panel-new-round">
+  <button class="back-link" data-back>‹ Back</button>
+  <div>
+    <span class="field-label">Live Shells</span>
+    <input type="number" id="new-live" step="1" placeholder="e.g. 3">
+  </div>
+  <div>
+    <span class="field-label">Blank Shells</span>
+    <input type="number" id="new-blank" step="1" placeholder="e.g. 2">
+  </div>
+  <button class="primary-btn" id="confirm-new-round">Start New Round</button>
+
+</div>
+
 <script>
   /* =========================================================
      INTEGRATION POINTS — set/read these from your own script
      =========================================================
 
      Variables (globals — read fresh whenever you set them):
-       GUARANTEED_NEXT   (boolean) — true skips the Live/Miss
+       GUARANTEED_NEXT   (boolean) — true skips the Live/blank
                           prompt on "Next" entirely.
        LIVE_PERCENTAGE   (number)  — read the instant "View" opens.
        BLANK_PERCENTAGE  (number)  — read the instant "View" opens.
 
      Events (dispatched on document):
        "next"
-         e.detail -> "live" | "miss" | null
+         e.detail -> "live" | "blank" | null
          (null when GUARANTEED_NEXT is true, since no input was taken)
        "phone-call"
          e.detail -> { number: <integer>, result: "live" | "blank" }
@@ -317,7 +331,8 @@
   var panels = {
     next: document.getElementById('panel-next'),
     phone: document.getElementById('panel-phone'),
-    view: document.getElementById('panel-view')
+    view: document.getElementById('panel-view'),
+    'new-round': document.getElementById('panel-new-round')
   };
 
   function showMenu() {
@@ -353,6 +368,11 @@
   document.getElementById('btn-next').addEventListener('click', function () {
     if (GUARANTEED_NEXT) {
       document.dispatchEvent(new CustomEvent('next', { detail: null, bubbles: true }));
+
+      document.getElementById('btn-next').style.border = '2px solid green';
+      setTimeout(function () {
+        document.getElementById('btn-next').style.removeProperty('border');
+      }, 1000);
       continueLoop();
       return;
     }
@@ -429,7 +449,30 @@
 
   document.getElementById('done-view').addEventListener('click', continueLoop);
 
-  //gamelogic code//d
+
+  document.getElementById('btn-new-round').addEventListener('click', function () {
+    document.getElementById('new-live').value = '';
+    document.getElementById('new-blank').value = '';
+    showPanel('new-round');
+  });
+
+  document.getElementById('confirm-new-round').addEventListener('click', function () {
+    var newLive = parseInt(document.getElementById('new-live').value, 10);
+    var newBlank = parseInt(document.getElementById('new-blank').value, 10);
+
+    if (isNaN(newLive) || isNaN(newBlank) || newLive <= 0 || newBlank <= 0) {
+      alert("Please enter valid positive integers for live and blank shells.");
+      return;
+    }
+
+    // Reset the game with new values
+    window.history.replaceState({}, '', `?live=${newLive}&blank=${newBlank}`);
+    this_game = new Game(newLive, newBlank);
+    updatePercentages();
+    continueLoop();
+  });
+
+  //gamelogic code//
   
 // JS has no built-in ValueError, so this small subclass mirrors Python's
 // exception type/message for anyone who wants to catch it specifically
@@ -461,6 +504,8 @@ class Game {
   }
 
   PhoneCall(index, status) {
+    //adds to the current_index
+    index = index + this.current_index - 1// 1-based index to 0-based index
     this.magazine[index].state = status;
   }
 
@@ -478,12 +523,7 @@ class Game {
     } else if (this.current_shell().state === "blank") {
       return 0.0;
     }
-
-    // to consider any future phone calls
-    // NOTE: .slice(current_index, -1) matches Python's magazine[current_index:-1]
-    // exactly, including the fact that it excludes the very last shell in the
-    // magazine from consideration. Kept as-is for exact logic parity.
-    for (const shell of this.magazine.slice(this.current_index, -1)) {
+    for (const shell of this.magazine.slice(this.current_index)) {
       const shell_state = shell.state;
       if (shell_state === "live") {
         potential_lives -= 1;
@@ -494,14 +534,23 @@ class Game {
       }
     }
 
+
     return potential_lives + potential_blanks > 0
       ? potential_lives / (potential_lives + potential_blanks)
       : "Error";
   }
 
   nextRound(roundState = null) {
-    this.current_shell(); // no-op call, kept to mirror the original exactly
-
+    if (this.current_index >= this.magazine.length) {
+      throw new ValueError("No more shells left in the magazine");
+    }
+    if (roundState == null) {
+      if (parseInt(this_game.LiveProbability()) === 1) {
+        roundState = "live";
+      } else if (parseInt(this_game.LiveProbability()) === 0) {
+        roundState = "blank";
+      }
+    }
     if (roundState === null && this.current_shell().state === null) {
       throw new ValueError("No round state provided");
     } else if (roundState === null && this.current_shell().state !== null) {
@@ -527,13 +576,13 @@ class Game {
 }
 
 const urlParams = new URLSearchParams(window.location.search);
-let live_query = 0;
-let blank_query = 0;
+var live_query = 0;
+var blank_query = 0;
 live_query = parseInt(urlParams.get('live')); 
 blank_query = parseInt(urlParams.get('blank'));
 
-if (isNaN(live_query) || isNaN(blank_query) || live_query < 0 || blank_query < 0) {
-  alert("Invalid query parameters. Please provide non-negative integers for 'live' and 'blank'.");
+if (isNaN(live_query) || isNaN(blank_query) || live_query <= 0 || blank_query <= 0) {
+  alert("Invalid query parameters. Please provide positive integers for 'live' and 'blank'.");
   throw new ValueError("Invalid query parameters.");
   //example url: http://localhost:6767/main.html?live=3&blank=2
 }
@@ -543,6 +592,7 @@ if (isNaN(live_query) || isNaN(blank_query) || live_query < 0 || blank_query < 0
 function updatePercentages() {
   LIVE_PERCENTAGE = Math.round(this_game.LiveProbability() * 100);
   BLANK_PERCENTAGE = 100 - LIVE_PERCENTAGE;
+  GUARANTEED_NEXT = (LIVE_PERCENTAGE === 100 || LIVE_PERCENTAGE === 0);
 }
 //init game object
 var this_game = new Game(live_query, blank_query);
@@ -551,10 +601,17 @@ updatePercentages();
 
 
 document.addEventListener('next', function (e) {
-  const result = e.detail; // "live" | "miss" | null
+  if (this_game.current_index >= this_game.magazine.length - 1) { //0 based index
+    //this is where create-game would be called. prompting for 2 new values for live and blank. For now, just alerting the user.
+    alert("No more shells left in the magazine");
+    return;
+  }
+
+
+  const result = e.detail; // "live" | "blank" | null
   if (result === "live") {
     this_game.nextRound("live");
-  } else if (result === "miss") {
+  } else if (result === "blank") {
     this_game.nextRound("blank");
   } else if (result === null) {
     this_game.nextRound();
@@ -566,6 +623,20 @@ document.addEventListener('next', function (e) {
 
 document.addEventListener('phone-call', function (e) {
   const { number, result } = e.detail; // { number: <integer>, result: "live" | "blank" }
+  if (result !== "live" && result !== "blank") {
+    console.error("Invalid result for 'phone-call' event:", result);
+    return;
+  }
+
+  if (number < 1) {
+    console.error("Invalid number for 'phone-call' event:", number);
+    return;
+  }
+  if (number + this_game.current_index > this_game.magazine.length) { // = 1-based index
+    console.error("Phone call number exceeds magazine length:", number);
+    return;
+  }
+
   this_game.PhoneCall(number, result);
   updatePercentages();
 });
