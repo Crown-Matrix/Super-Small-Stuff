@@ -325,6 +325,7 @@
   var GUARANTEED_NEXT = false;
   var LIVE_PERCENTAGE = 0;
   var BLANK_PERCENTAGE = 0;
+  var FIRST_LOAD = true;
 
   // ---------- Elements ----------
   var menu = document.getElementById('menu');
@@ -453,6 +454,16 @@
   document.getElementById('btn-new-round').addEventListener('click', function () {
     document.getElementById('new-live').value = '';
     document.getElementById('new-blank').value = '';
+    if (FIRST_LOAD) {
+      document.querySelectorAll('.back-link').forEach(function (link) {
+        link.style.display = 'none';
+      });
+    } else {
+      document.querySelectorAll('.back-link').forEach(function (link) {
+        link.style.removeProperty('display');
+      });
+    }
+    FIRST_LOAD = false;
     showPanel('new-round');
   });
 
@@ -466,7 +477,7 @@
     }
 
     // Reset the game with new values
-    window.history.replaceState({}, '', `?live=${newLive}&blank=${newBlank}`);
+    window.location.href = `?live=${newLive}&blank=${newBlank}`;
     this_game = new Game(newLive, newBlank);
     updatePercentages();
     continueLoop();
@@ -582,8 +593,7 @@ live_query = parseInt(urlParams.get('live'));
 blank_query = parseInt(urlParams.get('blank'));
 
 if (isNaN(live_query) || isNaN(blank_query) || live_query <= 0 || blank_query <= 0) {
-  alert("Invalid query parameters. Please provide positive integers for 'live' and 'blank'.");
-  throw new ValueError("Invalid query parameters.");
+  showPanel('new-round');
   //example url: http://localhost:6767/main.html?live=3&blank=2
 }
 
@@ -597,13 +607,20 @@ function updatePercentages() {
 //init game object
 var this_game = new Game(live_query, blank_query);
 //init initial scores for display
-updatePercentages();
+try {
+  document.querySelectorAll('.back-link').forEach(function (link) {
+        link.style.display = 'none';
+  });
+  updatePercentages();
+  
+} catch (error) {
+
+}
 
 
 document.addEventListener('next', function (e) {
-  if (this_game.current_index >= this_game.magazine.length - 1) { //0 based index
-    //this is where create-game would be called. prompting for 2 new values for live and blank. For now, just alerting the user.
-    alert("No more shells left in the magazine");
+  if (this_game.current_index >= this_game.magazine.length - 1) { //0 based index 
+    showPanel('new-round');
     return;
   }
 
