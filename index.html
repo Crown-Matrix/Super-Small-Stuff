@@ -320,15 +320,30 @@
       window.location.href = path;
     }
 
+    // Normalizes a name for matching: case-insensitive, and treats
+    // spaces, "%20", hyphens, and underscores as the same separator.
+    function normalizeName(str) {
+      return String(str)
+        .replace(/%20/gi, ' ')
+        .replace(/[-_\s]+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    // Finds the FILES key that matches `target` once both are normalized.
+    // Returns the actual key (original casing/spacing) or undefined.
+    function findMatchingKey(target) {
+      if (!target) return undefined;
+      const normTarget = normalizeName(target);
+      return Object.keys(FILES).find(k => normalizeName(k) === normTarget);
+    }
+
     function checkQueryRedirect() {
       const params = new URLSearchParams(window.location.search);
       for (const [key, value] of params.entries()) {
-        if (Object.prototype.hasOwnProperty.call(FILES, key)) {
-          goTo(getPath(FILES[key]));
-          return true;
-        }
-        if (value && Object.prototype.hasOwnProperty.call(FILES, value)) {
-          goTo(getPath(FILES[value]));
+        const matchKey = findMatchingKey(key) || findMatchingKey(value);
+        if (matchKey) {
+          goTo(getPath(FILES[matchKey]));
           return true;
         }
       }
@@ -340,8 +355,9 @@
       // "/website/123" -> "123", "/website/123/" -> "123"
       const segments = window.location.pathname.split('/').filter(Boolean);
       const last = segments[segments.length - 1];
-      if (last && Object.prototype.hasOwnProperty.call(FILES, last)) {
-        goTo(getPath(FILES[last]));
+      const matchKey = findMatchingKey(last);
+      if (matchKey) {
+        goTo(getPath(FILES[matchKey]));
         return true;
       }
       return false;
