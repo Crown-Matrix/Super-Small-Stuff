@@ -15,7 +15,6 @@ which type of addition do you wanna do?
 Input your decision: """
 
 
-
 def convertToBinary(x: int) -> str:
     return str(int( x < 0 )) + bin(abs(x))[2:]
 
