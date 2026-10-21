@@ -1,4 +1,19 @@
-setInterval(() => {
+// ==UserScript==
+// @name         Quizlet Ad blocker
+// @namespace    http://tampermonkey.net/
+// @version      2026-09-23
+// @description  Removes quizlet ads
+// @author       You
+// @match        https://quizlet.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    console.log('HELLO?')
+
+    setInterval(() => {
     // Classes
     [
         '.SetPageTerms-embeddedDesktopAdWrapper',
@@ -6,10 +21,12 @@ setInterval(() => {
         '.SiteAd-adContainer',
         '.TimeAndVisibilityAd',
         '.celtra-hotspot',
-        '.bx-creative'
+        '.bx-creative',
+        '.hideBelow--xl'
     ].forEach(s =>
         document.querySelectorAll(s).forEach(e => e.style.display = 'none')
     );
+
 
     // IDs
     [
@@ -38,3 +55,6 @@ setInterval(() => {
             .forEach(e => e.style.display = 'none');
     });
 }, 1000);
+
+
+})();
