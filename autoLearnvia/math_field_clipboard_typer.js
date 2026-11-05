@@ -209,10 +209,61 @@
         // QUESTION TEXT
         // ============================================================
 
-        const getCleanRecursiveText = (element) => {
+        // Elements whose text lives in an attribute rather than in children.
+        const DESCRIPTION_TAGS = ['IMG', 'AREA', 'INPUT', 'OBJECT', 'EMBED'];
+
+
+        // The only text an image has is its description, which is written into
+        // alt/title or into an element referenced by aria-labelledby. Those
+        // referenced labels are rendered off-screen on purpose, so they are
+        // read directly instead of going through the visibility checks.
+        function getElementDescriptions(element, consumed) {
+            const descriptions = [];
+
+            const push = (value) => {
+                const clean = (value ?? '').replace(/\s+/g, ' ').trim();
+
+                if (clean && !descriptions.includes(clean)) {
+                    descriptions.push(clean);
+                }
+            };
+
+            push(element.getAttribute('alt'));
+            push(element.getAttribute('aria-label'));
+            push(element.getAttribute('title'));
+
+            const labelledBy =
+                  element.getAttribute('aria-labelledby') ?? '';
+
+            for (const id of labelledBy.split(/\s+/)) {
+                if (!id) continue;
+
+                const label =
+                      element.ownerDocument?.getElementById(id);
+
+                // Already collected by this walk, so it is not emitted twice.
+                if (!label || consumed.has(label)) continue;
+
+                consumed.add(label);
+
+                push(label.textContent);
+            }
+
+            return descriptions;
+        }
+
+
+        // `consumed` carries the labelledby targets already collected, so a
+        // description can neither repeat nor be skipped when its label element
+        // is also part of the normal walk.
+        const getCleanRecursiveText = (element, consumed = new WeakSet()) => {
             if (!element) return '';
 
             if (element.nodeType === Node.ELEMENT_NODE) {
+                if (consumed.has(element)) {
+                    return '';
+                }
+
                 const tagName = element.tagName.toUpperCase();
                 const style = window.getComputedStyle(element);
 
@@ -234,6 +285,25 @@
                 ) {
                     return '';
                 }
+
+                if (DESCRIPTION_TAGS.includes(tagName)) {
+                    return getElementDescriptions(
+                        element,
+                        consumed
+                    ).join(' ');
+                }
+
+                // A label on an element with no text of its own (an icon
+                // button, a bare spinner) is all that element contributes.
+                if (
+                    !element.textContent?.trim() &&
+                    element.getAttribute('aria-label')
+                ) {
+                    return getElementDescriptions(
+                        element,
+                        consumed
+                    ).join(' ');
+                }
             }
 
             return Array.from(element.childNodes)
@@ -245,7 +315,7 @@
                 }
 
                 if (node.nodeType === Node.ELEMENT_NODE) {
-                    return getCleanRecursiveText(node);
+                    return getCleanRecursiveText(node, consumed);
                 }
 
                 return '';
@@ -1210,6 +1280,19 @@ ${problem}
         // copies and is cancelled; later clicks perform the choice selection.
         const selectedChoiceLists = new Set();
 
+        // The option list whose question was copied most recently. Returning
+        // to the tab answers it from the clipboard without another click.
+        let pendingChoiceList = null;
+
+        // Separate from `processingChoice`: a tab return waits on the OS to
+        // answer a clipboard read, and that wait must never block real clicks.
+        let handlingTabReturn = false;
+
+        // A click can arrive before the clipboard read it kicked off has
+        // landed. That click waits for a fresh read instead of giving up;
+        // this keeps two such waits from answering the same list twice.
+        let resolvingChoice = false;
+
 
         function describeNode(element) {
             if (!element) return 'null';
@@ -1291,6 +1374,30 @@ ${problem}
         }
 
 
+        // Finds the single match inside the nearest ancestor that holds
+        // exactly one, so a neighbouring question's prompt cannot be picked up
+        // by mistake.
+        function findOneInsideAncestors(element, selector) {
+            let parent = element?.parentElement ?? null;
+
+            while (parent) {
+                const matches = parent.querySelectorAll?.(selector);
+
+                if (matches?.length === 1) {
+                    return matches[0];
+                }
+
+                if (matches && matches.length > 1) {
+                    return null;
+                }
+
+                parent = parent.parentElement;
+            }
+
+            return null;
+        }
+
+
         // The question text lives in an "rt-Box" ancestor, but which marker
         // classes that box carries differs between question layouts, so try
         // the exact rule first and then progressively relax it.
@@ -1302,6 +1409,24 @@ ${problem}
                     (node) => node.classList.contains('rt-Box') &&
                         classStartsWith(node, mcqTextResourcePrefix) &&
                         classStartsWith(node, mcqHasQuestionsPrefix)
+                ),
+            },
+            {
+                // Immediately after the exact rule: the test hook is a precise
+                // marker, unlike the looser text-resource heuristics below,
+                // and some layouts carry no text-resource classes at all. It
+                // sits in a sibling branch of the option list, not above it.
+                name: 'test-question-prompt',
+                find: (element) => findOneInsideAncestors(
+                    element,
+                    '.test-question-prompt'
+                ),
+            },
+            {
+                name: 'question text inside the MCQ container',
+                find: (element) => findOneInsideAncestors(
+                    element,
+                    '.test-question-mcq [class*="_question-text_"]'
                 ),
             },
             {
@@ -1385,32 +1510,97 @@ ${problem}
         }
 
 
+        // Clipboard promises are not guaranteed to settle — a read issued
+        // while the document loses focus can stay pending — and the callers
+        // hold a guard across the await, so every clipboard call is bounded.
+        const CLIPBOARD_TIMEOUT_MS = 1500;
+
+        let clipboardReadId = 0;
+
+        // The newest read's promise. A read that gets superseded waits for
+        // this instead of reporting a stale answer.
+        let latestChoiceRead = Promise.resolve(null);
+
+
+        function withTimeout(promise, ms, label) {
+            let timer = null;
+
+            const timeout = new Promise((resolve, reject) => {
+                timer = setTimeout(
+                    () => reject(
+                        new Error(`${label} timed out after ${ms} ms`)
+                    ),
+                    ms
+                );
+            });
+
+            return Promise.race([promise, timeout])
+                .finally(() => clearTimeout(timer));
+        }
+
+
+        // Resolves to the choice the clipboard holds (null when it holds no
+        // `(Choice #N)`), or `undefined` when the clipboard could not be read
+        // at all — Chrome refuses reads while the document is not focused.
         async function refreshCachedChoice(source) {
-            try {
-                const clipboard =
-                    await navigator.clipboard.readText();
+            const readId = ++clipboardReadId;
 
-                const match = clipboard.match(mcqChoicePattern);
+            const read = (async () => {
+                try {
+                    const clipboard = await withTimeout(
+                        navigator.clipboard.readText(),
+                        CLIPBOARD_TIMEOUT_MS,
+                        'clipboard read'
+                    );
 
-                cachedChoiceIndex =
-                    match ? Number(match[1]) : null;
+                    const match = clipboard.match(mcqChoicePattern);
 
-                mcqLog(
-                    `choice cache refreshed (${source}) —`,
-                    JSON.stringify(clipboard),
-                    '→',
-                    cachedChoiceIndex === null
-                    ? 'no choice'
-                    : `choice ${cachedChoiceIndex}`
-                );
-            } catch (error) {
-                cachedChoiceIndex = null;
+                    const value = match ? Number(match[1]) : null;
 
-                mcqLog(
-                    `choice cache refresh failed (${source}) —`,
-                    error?.message ?? error
-                );
-            }
+                    mcqLog(
+                        `choice cache refreshed (${source}) —`,
+                        JSON.stringify(clipboard),
+                        '→',
+                        value === null ? 'no choice' : `choice ${value}`
+                    );
+
+                    return value;
+                } catch (error) {
+                    mcqLog(
+                        `choice cache refresh failed (${source}) —`,
+                        error?.message ?? error
+                    );
+
+                    return undefined;
+                }
+            })();
+
+            const settled = (async () => {
+                let value = await read;
+
+                // A newer read started while this one was in flight, so this
+                // one's answer may already be stale. Report whatever that
+                // newer read settles on: returning early with nothing here
+                // handed callers a null choice while the real answer was
+                // still arriving, which suppressed the click.
+                if (readId !== clipboardReadId) {
+                    value = await latestChoiceRead;
+
+                    return value;
+                }
+
+                // Only the newest read owns the cache, and a failed read is
+                // not evidence that the clipboard changed.
+                if (value !== undefined) {
+                    cachedChoiceIndex = value;
+                }
+
+                return value;
+            })();
+
+            latestChoiceRead = settled;
+
+            return settled;
         }
 
 
@@ -1435,6 +1625,116 @@ ${problem}
             }
 
             return element;
+        }
+
+
+        // Clicks option `choice` of a list. Returns whether a click was
+        // dispatched; false means the choice was missing or out of range.
+        function clickCachedChoice(element, choice = cachedChoiceIndex) {
+            const N = element.children.length;
+
+            const X = choice ?? null;
+
+            mcqLog(
+                'cached choice —',
+                X === null ? 'none' : X,
+                `(options: ${N})`
+            );
+
+            if (X === null) {
+                mcqLog('no cached choice, ignoring');
+
+                return false;
+            }
+
+            console.assert(
+                0 < X && X <= N,
+                `Choice #${X} is out of range (1–${N})`
+            );
+
+            if (!(0 < X && X <= N)) {
+                mcqLog(`choice ${X} is out of range (1–${N}), ignoring`);
+
+                return false;
+            }
+
+            const option = element.children[X - 1];
+
+            const input =
+                  typeof option.querySelector === 'function'
+            ? option.querySelector(mcqChoiceInputSelector)
+            : null;
+
+            const choiceTarget = input ?? option;
+
+            mcqLog(
+                `clicking option ${X} of ${N} —`,
+                describeNode(choiceTarget),
+                input ? '(input)' : '(option container)'
+            );
+
+            choiceTarget.click();
+
+            mcqLog(`option ${X} click dispatched`);
+
+            return true;
+        }
+
+
+        // Dispatches the cached choice with the re-entrancy guard held only
+        // around the synchronous click, so a pending clipboard read elsewhere
+        // can never lock the page.
+        function dispatchCachedChoice(element, choice = cachedChoiceIndex) {
+            processingChoice = true;
+
+            try {
+                if (!clickCachedChoice(element, choice)) {
+                    return false;
+                }
+
+                pendingChoiceList = null;
+
+                return true;
+            } finally {
+                processingChoice = false;
+            }
+        }
+
+
+        // The click handler needs `cachedChoiceIndex` synchronously to decide
+        // whether to swallow the click, but the read is async and usually has
+        // not landed yet. The click is already cancelled by then, so rather
+        // than swallowing it for nothing, wait for a fresh read and answer.
+        async function answerFromClipboard(element, source) {
+            if (resolvingChoice) {
+                mcqLog('already resolving a choice, ignoring');
+
+                return false;
+            }
+
+            resolvingChoice = true;
+
+            try {
+                mcqLog(`no cached choice yet (${source}), re-reading clipboard`);
+
+                const choice = await refreshCachedChoice(source);
+
+                if (!element.isConnected) {
+                    mcqLog('option list is gone, ignoring');
+
+                    return false;
+                }
+
+                if (choice === undefined) {
+                    mcqLog('clipboard unreadable, not answering');
+
+                    return false;
+                }
+
+                return dispatchCachedChoice(element, choice);
+            } finally {
+                resolvingChoice = false;
+            }
         }
 
 
@@ -1492,7 +1792,11 @@ ${problem}
 
                 try {
                     try {
-                        await navigator.clipboard.writeText(questionText);
+                        await withTimeout(
+                            navigator.clipboard.writeText(questionText),
+                            CLIPBOARD_TIMEOUT_MS,
+                            'clipboard write'
+                        );
                     } catch (error) {
                         mcqLog(
                             'could not write the clipboard —',
@@ -1509,6 +1813,10 @@ ${problem}
 
                     selectedChoiceLists.add(element);
 
+                    pendingChoiceList = element;
+
+                    tabReturnRetries = 0;
+
                     mcqLog(
                         'copied question text —',
                         `${questionText.length} chars`
@@ -1521,59 +1829,405 @@ ${problem}
             }
 
 
-            const X = cachedChoiceIndex;
-
-            mcqLog(
-                'cached choice —',
-                X === null ? 'none' : X
-            );
-
-            if (X === null) {
-                mcqLog('no cached choice, ignoring');
-
-                return;
-            }
-
-            console.assert(
-                0 < X && X <= N,
-                `Choice #${X} is out of range (1–${N})`
-            );
-
-            if (!(0 < X && X <= N)) {
-                mcqLog(`choice ${X} is out of range (1–${N}), ignoring`);
-
-                return;
-            }
-
             // Synchronous, so it actually cancels the click the user made.
             event.preventDefault();
             event.stopPropagation();
 
             mcqLog('cancelled the original click');
 
-            processingChoice = true;
+            if (cachedChoiceIndex !== null) {
+                dispatchCachedChoice(element);
 
-            try {
-                const option = element.children[X - 1];
+                return;
+            }
 
-                const input =
-                      typeof option.querySelector === 'function'
-                ? option.querySelector(mcqChoiceInputSelector)
-                : null;
+            await answerFromClipboard(element, 'click');
+        }
 
-                const choiceTarget = input ?? option;
 
-                mcqLog(
-                    `clicking option ${X} of ${N} —`,
-                    describeNode(choiceTarget),
-                    input ? '(input)' : '(option container)'
+        // ------------------------------------------------------------
+        // RIGHT-CLICK OVERRIDE
+        // ------------------------------------------------------------
+
+        // Answers normally come from the clipboard, and a plain click on an
+        // option is swallowed while the question is being copied. Right-
+        // clicking an option offers an explicit click instead, for when the
+        // clipboard answer is wrong or never arrives.
+
+        const OVERRIDE_MENU_ID = 'auto-learnvia-override-menu';
+
+        let overrideMenu = null;
+        let overrideMenuCleanup = null;
+
+
+        // The option the event landed on, plus its position in the list.
+        function findChoiceOption(target) {
+            const list = findOptionList(target);
+
+            if (!list) {
+                return null;
+            }
+
+            let option = target;
+
+            while (option && option.parentElement !== list) {
+                option = option.parentElement;
+            }
+
+            if (!option) {
+                return null;
+            }
+
+            return {
+                list,
+                option,
+                choice: [...list.children].indexOf(option) + 1,
+            };
+        }
+
+
+        function describeChoiceOption(option, choice) {
+            const text =
+                  getCleanRecursiveText(option)
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (!text) {
+                return `Choice #${choice}`;
+            }
+
+            const preview =
+                  text.length > 60
+                ? `${text.slice(0, 60)}…`
+                : text;
+
+            return `Choice #${choice}: ${preview}`;
+        }
+
+
+        function hideOverrideMenu() {
+            if (overrideMenuCleanup) {
+                overrideMenuCleanup();
+
+                overrideMenuCleanup = null;
+            }
+
+            overrideMenu?.remove();
+
+            overrideMenu = null;
+        }
+
+
+        // `processingChoice` is what keeps the capture-phase click handler
+        // out of this click: it neither cancels it nor copies the question.
+        function clickOptionDirectly(list, choice) {
+            hideOverrideMenu();
+
+            const clicked = dispatchCachedChoice(list, choice);
+
+            mcqLog(
+                `right-click override — choice ${choice}`,
+                clicked ? 'clicked' : 'not clicked'
+            );
+
+            if (!clicked) {
+                console.warn(
+                    `Could not click choice #${choice} of the MCQ.`
+                );
+            }
+
+            return clicked;
+        }
+
+
+        function showOverrideMenu(event, found) {
+            hideOverrideMenu();
+
+            const { list, option, choice } = found;
+
+            const menu = document.createElement('div');
+
+            menu.id = OVERRIDE_MENU_ID;
+
+            Object.assign(menu.style, {
+                position: 'fixed',
+                zIndex: '2147483647',
+                minWidth: '180px',
+                padding: '4px',
+                background: '#1f1f23',
+                color: '#f5f5f5',
+                border: '1px solid #4b4b55',
+                borderRadius: '6px',
+                boxShadow: '0 6px 24px rgba(0, 0, 0, 0.45)',
+                font: '12px/1.4 sans-serif',
+                userSelect: 'none',
+            });
+
+            const caption = document.createElement('div');
+
+            caption.textContent = describeChoiceOption(option, choice);
+
+            Object.assign(caption.style, {
+                maxWidth: '320px',
+                padding: '4px 8px 6px',
+                color: '#a8a8b3',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+            });
+
+            const item = document.createElement('button');
+
+            item.type = 'button';
+            item.textContent = `Override: click choice #${choice}`;
+
+            Object.assign(item.style, {
+                display: 'block',
+                width: '100%',
+                padding: '6px 8px',
+                background: 'transparent',
+                color: 'inherit',
+                border: '0',
+                borderRadius: '4px',
+                font: 'inherit',
+                textAlign: 'left',
+                whiteSpace: 'nowrap',
+                cursor: 'pointer',
+            });
+
+            item.addEventListener('click', (clickEvent) => {
+                clickEvent.preventDefault();
+                clickEvent.stopPropagation();
+
+                clickOptionDirectly(list, choice);
+            });
+
+            item.addEventListener('mouseenter', () => {
+                item.style.background = '#2f6feb';
+            });
+
+            item.addEventListener('mouseleave', () => {
+                item.style.background = 'transparent';
+            });
+
+            menu.append(caption, item);
+            document.body.appendChild(menu);
+
+            // A keyboard-invoked context menu reports no coordinates, so fall
+            // back to the option itself.
+            const optionRect = option.getBoundingClientRect();
+
+            const x = event.clientX || optionRect.left + 12;
+            const y = event.clientY || optionRect.top + 12;
+
+            const menuRect = menu.getBoundingClientRect();
+
+            const left = Math.min(
+                x,
+                window.innerWidth - menuRect.width - 8
+            );
+
+            const top = Math.min(
+                y,
+                window.innerHeight - menuRect.height - 8
+            );
+
+            menu.style.left = `${Math.max(8, left)}px`;
+            menu.style.top = `${Math.max(8, top)}px`;
+
+            overrideMenu = menu;
+
+            const listenerOptions = { capture: true };
+
+            const dismiss = (dismissEvent) => {
+                if (dismissEvent.type === 'keydown') {
+                    if (dismissEvent.key !== 'Escape') return;
+                } else if (menu.contains(dismissEvent.target)) {
+                    return;
+                }
+
+                hideOverrideMenu();
+            };
+
+            document.addEventListener(
+                'pointerdown',
+                dismiss,
+                listenerOptions
+            );
+
+            document.addEventListener(
+                'keydown',
+                dismiss,
+                listenerOptions
+            );
+
+            window.addEventListener('resize', hideOverrideMenu);
+            window.addEventListener('scroll', hideOverrideMenu, true);
+
+            overrideMenuCleanup = () => {
+                document.removeEventListener(
+                    'pointerdown',
+                    dismiss,
+                    listenerOptions
                 );
 
-                choiceTarget.click();
+                document.removeEventListener(
+                    'keydown',
+                    dismiss,
+                    listenerOptions
+                );
 
-                mcqLog(`option ${X} click dispatched`);
+                window.removeEventListener('resize', hideOverrideMenu);
+                window.removeEventListener(
+                    'scroll',
+                    hideOverrideMenu,
+                    true
+                );
+            };
+        }
+
+
+        function handleChoiceContextMenu(event) {
+            const found = findChoiceOption(event.target);
+
+            if (!found) {
+                hideOverrideMenu();
+
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+
+            showOverrideMenu(event, found);
+        }
+
+
+        document.addEventListener(
+            'contextmenu',
+            handleChoiceContextMenu,
+            true
+        );
+
+
+        // ------------------------------------------------------------
+        // RETURNING TO THE TAB
+        // ------------------------------------------------------------
+
+        // `focus` can fire while the return handler is still waiting on an
+        // unreadable clipboard, in which case that attempt is dropped. Retry a
+        // few times so coming back to the tab still answers on its own.
+        const TAB_RETURN_RETRY_LIMIT = 4;
+        const TAB_RETURN_RETRY_MS = 200;
+
+        let tabReturnRetries = 0;
+
+
+        function scheduleTabReturnRetry() {
+            if (tabReturnRetries >= TAB_RETURN_RETRY_LIMIT) {
+                mcqLog('giving up on the tab return (clipboard unreadable)');
+
+                tabReturnRetries = 0;
+
+                return;
+            }
+
+            tabReturnRetries += 1;
+
+            setTimeout(() => {
+                if (!pendingChoiceList || !pendingChoiceList.isConnected) {
+                    tabReturnRetries = 0;
+
+                    return;
+                }
+
+                if (document.visibilityState !== 'visible') return;
+
+                // The read would only be refused again.
+                if (!document.hasFocus()) return;
+
+                handleReturnToTab({ type: 'retry' });
+            }, TAB_RETURN_RETRY_MS);
+        }
+
+
+        // Leaving the tab to get an answer keeps the question armed, so
+        // coming back applies `(Choice #N)` from the clipboard directly.
+        async function handleReturnToTab(event) {
+            if (
+                event?.type === 'visibilitychange' &&
+                document.visibilityState !== 'visible'
+            ) {
+                return;
+            }
+
+            const element = pendingChoiceList;
+
+            if (!element || !element.isConnected) {
+                return;
+            }
+
+            if (handlingTabReturn) {
+                mcqLog('already handling a tab return, ignoring');
+
+                return;
+            }
+
+            // A genuine return (not a retry) gets a fresh retry budget.
+            if (event?.type !== 'retry') {
+                tabReturnRetries = 0;
+            }
+
+            handlingTabReturn = true;
+
+            let failed = false;
+
+            try {
+                const choice = await refreshCachedChoice(
+                    event?.type ?? 'tab return'
+                );
+
+                // The user may have moved on while the clipboard was read.
+                if (pendingChoiceList !== element) {
+                    return;
+                }
+
+                if (!element.isConnected) {
+                    pendingChoiceList = null;
+
+                    return;
+                }
+
+                // `visibilitychange` fires just before the document gains
+                // focus, so Chrome can refuse the read here. Stay armed and
+                // retry rather than answering with nothing.
+                if (choice === undefined) {
+                    failed = true;
+
+                    mcqLog('clipboard unreadable right now, retrying shortly');
+
+                    return;
+                }
+
+                // A click that landed while this read was in flight resolves
+                // through the click path; letting both dispatch would click
+                // the option twice and toggle a checkbox back off.
+                if (resolvingChoice) {
+                    mcqLog('a click is already resolving this choice');
+
+                    return;
+                }
+
+                // Held only around the synchronous dispatch, which is all the
+                // re-entrant click needs suppressing for. A slow clipboard
+                // read therefore cannot lock the page's clicks.
+                dispatchCachedChoice(element, choice);
             } finally {
-                processingChoice = false;
+                handlingTabReturn = false;
+
+                if (failed) {
+                    scheduleTabReturnRetry();
+                }
             }
         }
 
@@ -1595,6 +2249,596 @@ ${problem}
             handleChoiceFocusIn,
             true
         );
+
+        document.addEventListener(
+            'visibilitychange',
+            handleReturnToTab
+        );
+
+        // `visibilitychange` can fire before the document is focused, in which
+        // case the clipboard read is refused; this retries once it is.
+        window.addEventListener(
+            'focus',
+            handleReturnToTab
+        );
+
+
+        // ============================================================
+        // NEXT QUESTION (ALL QUESTION TYPES)
+        // ============================================================
+
+        const NEXT_QUESTION_SELECTOR =
+              'button[aria-label="Next question"]';
+
+        const NEXT_QUESTION_ENABLED_SELECTOR =
+              `${NEXT_QUESTION_SELECTOR}:not([aria-disabled="true"])`;
+
+
+        function findNextQuestionButton() {
+            for (
+                const button of document.querySelectorAll(
+                    NEXT_QUESTION_ENABLED_SELECTOR
+                )
+            ) {
+                if (button.disabled === true) continue;
+
+                // Skip copies that are rendered but not on screen.
+                if (button.getClientRects().length === 0) continue;
+
+                return button;
+            }
+
+            return null;
+        }
+
+
+        // The button is only enabled once the question has been answered, so
+        // the click is driven by the state change rather than by a timer.
+        let lastNextQuestionButton = null;
+        let lastNextQuestionEnabled = false;
+
+        let nextQuestionCheckTimer = null;
+
+
+        function advanceToNextQuestion() {
+            const button = findNextQuestionButton();
+
+            const enabled = button !== null;
+
+            const wasEnabled =
+                  enabled &&
+                  lastNextQuestionEnabled &&
+                  button === lastNextQuestionButton;
+
+            lastNextQuestionButton = button;
+            lastNextQuestionEnabled = enabled;
+
+            // Only act on the disabled → enabled transition (or a new node),
+            // so one answer advances exactly one question.
+            if (!enabled || wasEnabled) {
+                return;
+            }
+
+            console.log(
+                'AUTO LEARNVIA: advancing to the next question'
+            );
+
+            button.click();
+        }
+
+
+        // Mutation bursts are coalesced into a single DOM read.
+        function scheduleNextQuestionCheck() {
+            if (nextQuestionCheckTimer !== null) return;
+
+            nextQuestionCheckTimer = setTimeout(
+                () => {
+                    nextQuestionCheckTimer = null;
+
+                    advanceToNextQuestion();
+                },
+                0
+            );
+        }
+
+
+        // Prime the state so a button that was already enabled when the
+        // script loaded (an earlier answer, a revisited question) is left
+        // alone until it changes.
+        lastNextQuestionButton = findNextQuestionButton();
+        lastNextQuestionEnabled = lastNextQuestionButton !== null;
+
+
+        const nextQuestionObserver = new MutationObserver(
+            scheduleNextQuestionCheck
+        );
+
+        nextQuestionObserver.observe(
+            document.documentElement,
+            {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['aria-disabled'],
+            }
+        );
+
+
+        // ============================================================
+        // DOCUMENT MODIFICATION WATCHER (debug)
+        // ============================================================
+
+        // Logs every DOM mutation together with the call site that caused it.
+        // This is a diagnostics tool: it wraps hot DOM APIs and builds a stack
+        // per mutation, so set it to false when it is not needed.
+        const MOD_WATCH_ENABLED = true;
+
+        // Narrow the log to one subtree, e.g. '.test-question-mcq'.
+        const MOD_WATCH_SELECTOR = null;
+
+        const MOD_LOG_PREFIX = '[Auto Learnvia][mod]';
+
+        const MOD_TRACE_LIMIT = 400;
+        const MOD_LOG_LIMIT = 1000;
+        const MOD_PRINT_PER_BATCH = 15;
+
+        const MOD_PATCHED = Symbol.for('autoLearnvia.patched');
+
+        // The patched DOM methods outlive initialize(), so they report through
+        // a global sink instead of a closure the next initialize() would strand.
+        const MOD_SINK_KEY = '__learnviaModSink';
+
+        const modObserveOptions = {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeOldValue: true,
+            characterData: true,
+            characterDataOldValue: true,
+        };
+
+        const modTraces = [];
+        const modLog = [];
+
+        let modificationObserver = null;
+
+
+        function recordModification(api, target, detail) {
+            window[MOD_SINK_KEY]?.(api, target, detail);
+        }
+
+
+        function modificationStack() {
+            const limit = Error.stackTraceLimit;
+
+            Error.stackTraceLimit = 50;
+
+            const stack = new Error().stack ?? '';
+
+            Error.stackTraceLimit = limit;
+
+            return stack;
+        }
+
+
+        // Drops this file's own frames so the first line is the real caller.
+        function firstSourceFrame(stack) {
+            const frames = String(stack ?? '')
+                .split('\n')
+                .map((line) => line.trim())
+                .filter((line) => line.startsWith('at '))
+                .filter(
+                    (line) => !/autoLearnviaProxy|recordModification|modificationStack|firstSourceFrame/.test(line)
+                );
+
+            return frames[0] ?? '(unknown)';
+        }
+
+
+        function describeModification(record) {
+            if (record.type === 'attributes') {
+                const value = record.target.getAttribute?.(record.attributeName);
+
+                return `${record.attributeName}: ${String(record.oldValue ?? '').slice(0, 60)} → ${String(value ?? '').slice(0, 60)}`;
+            }
+
+            if (record.type === 'characterData') {
+                return `${JSON.stringify(record.oldValue ?? '')} → ${JSON.stringify(record.target.data ?? '')}`
+                    .slice(0, 160);
+            }
+
+            const added = [...record.addedNodes].map(describeNode).join(', ');
+            const removed = [...record.removedNodes].map(describeNode).join(', ');
+
+            return `+[${added}] -[${removed}]`.slice(0, 200);
+        }
+
+
+        // The newest recorded call whose receiver is the changed node or one of
+        // its ancestors: mutation observers fire after the fact, so the stack
+        // has to come from the patched DOM APIs, not from the record itself.
+        function culpritFor(record) {
+            for (let index = modTraces.length - 1; index >= 0; index -= 1) {
+                const trace = modTraces[index];
+
+                for (let node = record.target; node; node = node.parentNode) {
+                    if (node === trace.target) {
+                        return trace;
+                    }
+                }
+            }
+
+            return modTraces[modTraces.length - 1] ?? null;
+        }
+
+
+        function shouldWatch(target) {
+            if (MOD_WATCH_SELECTOR === null) {
+                return true;
+            }
+
+            const element = target?.nodeType === Node.ELEMENT_NODE
+                ? target
+                : target?.parentElement;
+
+            return !!element?.closest?.(MOD_WATCH_SELECTOR);
+        }
+
+
+        function reportModification(record) {
+            const culprit = culpritFor(record);
+
+            const entry = {
+                at: Math.round(performance.now()),
+                change: describeModification(record),
+                via: culprit?.api ?? '(unknown)',
+                detail: culprit?.detail ?? '',
+                source: firstSourceFrame(culprit?.stack),
+                stack: culprit?.stack ?? '',
+            };
+
+            modLog.push(entry);
+
+            if (modLog.length > MOD_LOG_LIMIT) {
+                modLog.shift();
+            }
+
+            return entry;
+        }
+
+
+        function patchMutationMethod(owner, name, detailFor) {
+            const original = owner?.[name];
+
+            if (typeof original !== 'function' || original[MOD_PATCHED]) {
+                return;
+            }
+
+            const patched = function autoLearnviaProxy(...args) {
+                recordModification(
+                    `${describeNode(this)}.${name}`,
+                    this,
+                    detailFor?.(args)
+                );
+
+                return original.apply(this, args);
+            };
+
+            patched[MOD_PATCHED] = true;
+
+            owner[name] = patched;
+        }
+
+
+        function patchMutationSetter(owner, name) {
+            const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+
+            if (!descriptor?.set || descriptor.set[MOD_PATCHED]) {
+                return;
+            }
+
+            const patched = function autoLearnviaProxy(value) {
+                recordModification(
+                    `set ${describeNode(this)}.${name}`,
+                    this,
+                    String(value ?? '').slice(0, 120)
+                );
+
+                return descriptor.set.call(this, value);
+            };
+
+            patched[MOD_PATCHED] = true;
+
+            Object.defineProperty(owner, name, {
+                ...descriptor,
+                set: patched,
+            });
+        }
+
+
+        function installMutationHooks() {
+            for (const name of [
+                'appendChild', 'insertBefore', 'removeChild', 'replaceChild',
+            ]) {
+                patchMutationMethod(Node.prototype, name);
+            }
+
+            for (const name of [
+                'append', 'prepend', 'replaceChildren',
+                'insertAdjacentElement', 'before', 'after',
+                'replaceWith', 'remove',
+            ]) {
+                patchMutationMethod(Element.prototype, name);
+            }
+
+            patchMutationMethod(
+                Element.prototype,
+                'insertAdjacentHTML',
+                (args) => String(args[1] ?? '')
+            );
+
+            for (const name of [
+                'setAttribute', 'setAttributeNS', 'removeAttribute',
+            ]) {
+                patchMutationMethod(
+                    Element.prototype,
+                    name,
+                    (args) => String(args[1] ?? args[0] ?? '')
+                );
+            }
+
+            for (const name of ['add', 'remove', 'toggle', 'replace']) {
+                patchMutationMethod(
+                    DOMTokenList.prototype,
+                    name,
+                    (args) => args.join(' ')
+                );
+            }
+
+            patchMutationMethod(
+                CSSStyleDeclaration.prototype,
+                'setProperty',
+                (args) => `${args[0]}=${args[1]}`
+            );
+
+            for (const name of ['innerHTML', 'outerHTML']) {
+                patchMutationSetter(Element.prototype, name);
+            }
+
+            patchMutationSetter(Node.prototype, 'textContent');
+            patchMutationSetter(Node.prototype, 'nodeValue');
+            patchMutationSetter(CharacterData.prototype, 'data');
+        }
+
+
+        if (MOD_WATCH_ENABLED) {
+            modificationObserver = new MutationObserver((records) => {
+                let printed = 0;
+
+                for (const record of records) {
+                    if (!shouldWatch(record.target)) continue;
+
+                    const entry = reportModification(record);
+
+                    // Every record is kept; only a slice is printed, so a
+                    // burst of mutations cannot lock up the console.
+                    if (printed >= MOD_PRINT_PER_BATCH) continue;
+
+                    printed += 1;
+
+                    console.groupCollapsed(
+                        `${MOD_LOG_PREFIX} ${entry.change}`
+                    );
+                    console.log('via   ', entry.via);
+                    console.log('from  ', entry.source);
+
+                    if (entry.detail) {
+                        console.log('detail', entry.detail);
+                    }
+
+                    console.log(entry.stack);
+                    console.groupEnd();
+                }
+            });
+
+            modificationObserver.observe(
+                document.documentElement,
+                modObserveOptions
+            );
+
+            window[MOD_SINK_KEY] = (api, target, detail) => {
+                modTraces.push({
+                    api,
+                    target,
+                    detail: String(detail ?? '').slice(0, 160),
+                    at: Math.round(performance.now()),
+                    stack: modificationStack(),
+                });
+
+                if (modTraces.length > MOD_TRACE_LIMIT) {
+                    modTraces.shift();
+                }
+            };
+
+            installMutationHooks();
+        }
+
+
+        window.__learnviaModLog = {
+            entries: modLog,
+            traces: modTraces,
+            table: () => console.table(
+                modLog.map(({ at, change, via, detail, source }) => ({
+                    at, change, via, detail, source,
+                }))
+            ),
+            last: (count = 10) => modLog.slice(-count),
+            stop: () => modificationObserver?.disconnect(),
+            start: () => modificationObserver?.observe(
+                document.documentElement,
+                modObserveOptions
+            ),
+        };
+
+
+        // ============================================================
+        // VIDEO NARRATION TRANSCRIPT (ARIA LIVE REGIONS)
+        // ============================================================
+
+        // The player narrates each segment into a polite live region instead
+        // of shipping a caption file, so the transcript only exists as a
+        // sequence of announcements while the video plays.
+        const TRANSCRIPT_LOG_PREFIX = '[Auto Learnvia][transcript]';
+
+        const TRANSCRIPT_SELECTOR =
+              '[aria-live="polite"][aria-atomic="true"]';
+
+        const TRANSCRIPT_LINE_LIMIT = 5000;
+
+        const transcriptLines = [];
+
+        // element → the text already recorded for it, so a re-render that
+        // leaves the text alone is not recorded twice.
+        const transcriptSeen = new WeakMap();
+
+        const transcriptRoots = new Set();
+        const transcriptObservers = [];
+
+        let transcriptRepollTimer = null;
+
+
+        function normaliseTranscriptText(text) {
+            return String(text ?? '').replace(/\s+/g, ' ').trim();
+        }
+
+
+        function recordTranscriptLine(text) {
+            const line = normaliseTranscriptText(text);
+
+            if (!line) return;
+
+            // The same segment can be announced twice in a row.
+            if (transcriptLines[transcriptLines.length - 1] === line) return;
+
+            transcriptLines.push(line);
+
+            if (transcriptLines.length > TRANSCRIPT_LINE_LIMIT) {
+                transcriptLines.shift();
+            }
+
+            console.log(`${TRANSCRIPT_LOG_PREFIX} +`, line);
+        }
+
+
+        function scanTranscriptRegions(root) {
+            let regions = [];
+
+            try {
+                regions = [...(root.querySelectorAll?.(TRANSCRIPT_SELECTOR) ?? [])];
+            } catch {
+                return;
+            }
+
+            for (const region of regions) {
+                const text = normaliseTranscriptText(region.textContent);
+
+                if (transcriptSeen.get(region) === text) continue;
+
+                transcriptSeen.set(region, text);
+
+                recordTranscriptLine(text);
+            }
+        }
+
+
+        // The live region can sit in a shadow root, which a document-level
+        // observer never sees, so every open root gets its own observer.
+        function collectTranscriptRoots(root, roots = []) {
+            roots.push(root);
+
+            let elements = [];
+
+            try {
+                elements = [...(root.querySelectorAll?.('*') ?? [])];
+            } catch {
+                return roots;
+            }
+
+            for (const element of elements) {
+                if (element.shadowRoot) {
+                    collectTranscriptRoots(element.shadowRoot, roots);
+                }
+            }
+
+            return roots;
+        }
+
+
+        function watchTranscriptRoots() {
+            for (const root of collectTranscriptRoots(document)) {
+                if (transcriptRoots.has(root)) continue;
+
+                transcriptRoots.add(root);
+
+                scanTranscriptRegions(root);
+
+                const observer = new MutationObserver(() => {
+                    scanTranscriptRegions(root);
+
+                    // The player may mount a new shadow root mid-playback.
+                    scheduleTranscriptRepoll();
+                });
+
+                observer.observe(
+                    root === document ? document.documentElement : root,
+                    {
+                        subtree: true,
+                        childList: true,
+                        characterData: true,
+                    }
+                );
+
+                transcriptObservers.push(observer);
+            }
+        }
+
+
+        function scheduleTranscriptRepoll() {
+            if (transcriptRepollTimer !== null) return;
+
+            transcriptRepollTimer = setTimeout(
+                () => {
+                    transcriptRepollTimer = null;
+
+                    watchTranscriptRoots();
+                },
+                1000
+            );
+        }
+
+
+        watchTranscriptRoots();
+
+
+        window.__learnviaTranscript = {
+            lines: transcriptLines,
+            text: () => transcriptLines.join('\n'),
+            copy: async () => {
+                const text = transcriptLines.join('\n');
+
+                await navigator.clipboard.writeText(text);
+
+                console.log(
+                    `${TRANSCRIPT_LOG_PREFIX} copied`,
+                    transcriptLines.length,
+                    'lines'
+                );
+            },
+            clear: () => {
+                transcriptLines.length = 0;
+            },
+            rescan: () => watchTranscriptRoots(),
+        };
 
 
         // ============================================================
@@ -1624,6 +2868,51 @@ ${problem}
                 handleChoiceFocusIn,
                 true
             );
+
+            document.removeEventListener(
+                'visibilitychange',
+                handleReturnToTab
+            );
+
+            window.removeEventListener(
+                'focus',
+                handleReturnToTab
+            );
+
+            document.removeEventListener(
+                'contextmenu',
+                handleChoiceContextMenu,
+                true
+            );
+
+            hideOverrideMenu();
+
+            nextQuestionObserver.disconnect();
+
+            modificationObserver?.disconnect();
+
+            modificationObserver = null;
+
+            window[MOD_SINK_KEY] = null;
+
+            for (const observer of transcriptObservers) {
+                observer.disconnect();
+            }
+
+            transcriptObservers.length = 0;
+            transcriptRoots.clear();
+
+            if (transcriptRepollTimer !== null) {
+                clearTimeout(transcriptRepollTimer);
+
+                transcriptRepollTimer = null;
+            }
+
+            if (nextQuestionCheckTimer !== null) {
+                clearTimeout(nextQuestionCheckTimer);
+
+                nextQuestionCheckTimer = null;
+            }
         };
     }
 
