@@ -37,25 +37,8 @@ from CustomMath import sine, ln, gamma
 from LinkedList import linked_list
 ```
 
-script from `ad_blocker` is meant to be pasted into your browser dev tools console
 
-These are made especially for the website they are associated with and will barely extend to any other website unless the two websites are developed in a similar way.
 
-```bash
-
-#to copy and paste it, so you can paste it into ur browser console:
-
-cat chess_ad_remover.js | pbcopy # macOS
-
-type chess_ad_remover.js | clip # Windows Command Prompt (general Windows users)
-
-Get-Content chess_ad_remover.js | Set-Clipboard # Windows PowerShell
-
-cat chess_ad_remover.js | wl-copy # Linux (Wayland)
-
-cat chess_ad_remover.js | xclip -selection clipboard # Linux (X11)
-
-```
 
 
 ## TinyURLs
