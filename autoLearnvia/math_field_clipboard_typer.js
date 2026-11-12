@@ -37,7 +37,15 @@
 
         let handlingFocus = false;
 
+        // Set while a right-click re-copy runs, so a stray focus event cannot
+        // start the normal focus flow in the middle of it.
+        let recopying = false;
+
         const NEW_LINE_TOKEN = '\\new line\\';
+
+        // Clipboard answers are prefixed with this marker to tell an
+        // intentional paste apart from the question text copied on focus.
+        const CLIPBOARD_SENTINEL = '##########';
 
         const arrowCommands = {
             up: 'moveUp',
@@ -1120,7 +1128,7 @@ ${problem}
         // ============================================================
 
         async function handleFocus(event) {
-            if (handlingFocus) return;
+            if (handlingFocus || recopying) return;
 
             const textbox =
                   findLongAnswerTextbox(event);
@@ -1178,11 +1186,13 @@ ${problem}
 
                 if (
                     clipboardText.startsWith(
-                        '##########'
+                        CLIPBOARD_SENTINEL
                     )
                 ) {
                     await navigator.clipboard.writeText(
-                        clipboardText.slice(10)
+                        clipboardText.slice(
+                            CLIPBOARD_SENTINEL.length
+                        )
                     );
 
                     intentional_paste = true;
@@ -1252,6 +1262,287 @@ ${problem}
         document.addEventListener(
             'focusin',
             handleFocus
+        );
+
+
+        // ============================================================
+        // RIGHT-CLICK COPY MENU (LONG AND SHORT ANSWER)
+        // ============================================================
+
+        // The question text is normally copied to the clipboard once, on the
+        // first focus of an answer field. Right-clicking an answer field
+        // offers to copy it again, for when that first copy went wrong or
+        // never arrived — the same explicit override a right-click gives an
+        // MCQ option. Only the copy is repeated, never the paste: the field
+        // is still filled in by the focus that follows, as usual.
+
+        const ANSWER_MENU_ID = 'auto-learnvia-answer-menu';
+
+        let answerMenu = null;
+        let answerMenuCleanup = null;
+
+
+        function hideAnswerMenu() {
+            if (answerMenuCleanup) {
+                answerMenuCleanup();
+
+                answerMenuCleanup = null;
+            }
+
+            answerMenu?.remove();
+
+            answerMenu = null;
+        }
+
+
+        // The answer field the event landed on, whichever type it is.
+        function findAnswerTarget(event) {
+            const textbox =
+                  findLongAnswerTextbox(event);
+
+            if (textbox) {
+                return { textbox, field: null };
+            }
+
+            const field =
+                  findMathField(event);
+
+            return field ? { textbox: null, field } : null;
+        }
+
+
+        // Runs the copy path the first focus would have run, ignoring that
+        // this field already had its question copied.
+        async function copyAnswerQuestionAgain(found) {
+            hideAnswerMenu();
+
+            if (recopying || handlingFocus) {
+                console.warn(
+                    'AUTO LEARNVIA: a copy is already in progress, so the right-click was ignored.'
+                );
+
+                return;
+            }
+
+            const { textbox, field } = found;
+
+            const target = textbox ?? field;
+
+            recopying = true;
+
+            // `focus()` fires the normal focus flow, which would paste into
+            // the field now that it counts as already copied; keep that out
+            // of this one.
+            handlingFocus = true;
+
+            try {
+                // Refocus first: it is the caret the user expects to get
+                // back, and the question text is read from the field's
+                // surroundings.
+                target.focus();
+
+                if (textbox) {
+                    // Forget that this box already had its question copied,
+                    // so the copy path runs again just as it does on the
+                    // first focus.
+                    selectedTextboxes.delete(textbox);
+
+                    await handleLongAnswerTextbox(
+                        textbox
+                    );
+
+                    return;
+                }
+
+                selectedFields.delete(field);
+
+                await copyShortAnswerQuestionText(
+                    field
+                );
+
+            } catch (error) {
+                console.error(
+                    'Could not copy the question text again:',
+                    error
+                );
+            } finally {
+                handlingFocus = false;
+                recopying = false;
+            }
+        }
+
+
+        function showAnswerMenu(event, found) {
+            hideAnswerMenu();
+
+            const { textbox, field } = found;
+
+            const target = textbox ?? field;
+
+            const menu = document.createElement('div');
+
+            menu.id = ANSWER_MENU_ID;
+
+            Object.assign(menu.style, {
+                position: 'fixed',
+                zIndex: '2147483647',
+                minWidth: '180px',
+                padding: '4px',
+                background: '#1f1f23',
+                color: '#f5f5f5',
+                border: '1px solid #4b4b55',
+                borderRadius: '6px',
+                boxShadow: '0 6px 24px rgba(0, 0, 0, 0.45)',
+                font: '12px/1.4 sans-serif',
+                userSelect: 'none',
+            });
+
+            const caption = document.createElement('div');
+
+            caption.textContent = textbox
+                ? 'Long answer'
+                : 'Short answer';
+
+            Object.assign(caption.style, {
+                maxWidth: '320px',
+                padding: '4px 8px 6px',
+                color: '#a8a8b3',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+            });
+
+            const item = document.createElement('button');
+
+            item.type = 'button';
+            item.textContent = 'Copy question again';
+
+            Object.assign(item.style, {
+                display: 'block',
+                width: '100%',
+                padding: '6px 8px',
+                background: 'transparent',
+                color: 'inherit',
+                border: '0',
+                borderRadius: '4px',
+                font: 'inherit',
+                textAlign: 'left',
+                whiteSpace: 'nowrap',
+                cursor: 'pointer',
+            });
+
+            item.addEventListener('click', (clickEvent) => {
+                clickEvent.preventDefault();
+                clickEvent.stopPropagation();
+
+                copyAnswerQuestionAgain(found);
+            });
+
+            item.addEventListener('mouseenter', () => {
+                item.style.background = '#2f6feb';
+            });
+
+            item.addEventListener('mouseleave', () => {
+                item.style.background = 'transparent';
+            });
+
+            menu.append(caption, item);
+            document.body.appendChild(menu);
+
+            // A keyboard-invoked context menu reports no coordinates, so fall
+            // back to the answer field itself.
+            const targetRect = target.getBoundingClientRect();
+
+            const x = event.clientX || targetRect.left + 12;
+            const y = event.clientY || targetRect.top + 12;
+
+            const menuRect = menu.getBoundingClientRect();
+
+            const left = Math.min(
+                x,
+                window.innerWidth - menuRect.width - 8
+            );
+
+            const top = Math.min(
+                y,
+                window.innerHeight - menuRect.height - 8
+            );
+
+            menu.style.left = `${Math.max(8, left)}px`;
+            menu.style.top = `${Math.max(8, top)}px`;
+
+            answerMenu = menu;
+
+            const listenerOptions = { capture: true };
+
+            const dismiss = (dismissEvent) => {
+                if (dismissEvent.type === 'keydown') {
+                    if (dismissEvent.key !== 'Escape') return;
+                } else if (menu.contains(dismissEvent.target)) {
+                    return;
+                }
+
+                hideAnswerMenu();
+            };
+
+            document.addEventListener(
+                'pointerdown',
+                dismiss,
+                listenerOptions
+            );
+
+            document.addEventListener(
+                'keydown',
+                dismiss,
+                listenerOptions
+            );
+
+            window.addEventListener('resize', hideAnswerMenu);
+            window.addEventListener('scroll', hideAnswerMenu, true);
+
+            answerMenuCleanup = () => {
+                document.removeEventListener(
+                    'pointerdown',
+                    dismiss,
+                    listenerOptions
+                );
+
+                document.removeEventListener(
+                    'keydown',
+                    dismiss,
+                    listenerOptions
+                );
+
+                window.removeEventListener('resize', hideAnswerMenu);
+                window.removeEventListener(
+                    'scroll',
+                    hideAnswerMenu,
+                    true
+                );
+            };
+        }
+
+
+        function handleAnswerContextMenu(event) {
+            const found = findAnswerTarget(event);
+
+            if (!found) {
+                hideAnswerMenu();
+
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+
+            showAnswerMenu(event, found);
+        }
+
+
+        document.addEventListener(
+            'contextmenu',
+            handleAnswerContextMenu,
+            true
         );
 
 
@@ -1472,6 +1763,26 @@ ${problem}
                 },
             },
         ];
+
+
+        // The options as text, numbered the way an answer refers to them
+        // (`(Choice #N)`). Image options have no text of their own beyond the
+        // description of the picture, and that description is the only thing
+        // that tells such options apart, so it has to be included.
+        function getChoiceListText(list) {
+            return [...list.children]
+                .map((option, index) => {
+                    const text = getCleanRecursiveText(option)
+                        .replace(/\s+/g, ' ')
+                        .trim();
+
+                    return text
+                        ? `(Choice #${index + 1}) ${text}`
+                        : '';
+                })
+                .filter(Boolean)
+                .join('\n');
+        }
 
 
         function getMcqText(element) {
@@ -1770,15 +2081,25 @@ ${problem}
             // First click on a list: copy the question text instead of
             // selecting anything.
             if (!selectedChoiceLists.has(element)) {
-                const questionText = getMcqText(element);
+                const promptText = getMcqText(element);
 
-                if (!questionText.trim()) {
+                if (!promptText.trim()) {
                     mcqLog(
                         'could not find question text, letting the click through'
                     );
 
                     return;
                 }
+
+                // The prompt alone does not say what can be chosen, so the
+                // options are copied with it. Without them a question whose
+                // options are images arrives with nothing to answer against.
+                const questionText = [
+                    promptText,
+                    getChoiceListText(element),
+                ]
+                    .filter(Boolean)
+                    .join('\n\n');
 
                 // Synchronous, so the click cannot select an option.
                 event.preventDefault();
@@ -2884,6 +3205,14 @@ ${problem}
                 handleChoiceContextMenu,
                 true
             );
+
+            document.removeEventListener(
+                'contextmenu',
+                handleAnswerContextMenu,
+                true
+            );
+
+            hideAnswerMenu();
 
             hideOverrideMenu();
 
