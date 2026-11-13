@@ -2049,6 +2049,107 @@ ${problem}
         }
 
 
+        // The prompt alone does not say what can be chosen, so the options are
+        // copied with it. Without them a question whose options are images
+        // arrives with nothing to answer against.
+        function buildMcqQuestionText(list) {
+            const promptText = getMcqText(list);
+
+            if (!promptText.trim()) {
+                return '';
+            }
+
+            return [
+                promptText,
+                getChoiceListText(list),
+            ]
+                .filter(Boolean)
+                .join('\n\n');
+        }
+
+
+        // Writes the question text out and arms the list, so the answer is
+        // pasted in on the next click or tab return. `processingChoice` is
+        // held for the write, which is what keeps the click handler out of
+        // this list in the meantime; false means the write failed.
+        async function copyMcqQuestionText(list, questionText) {
+            // Forget that this list already had its question copied, so it is
+            // armed again from scratch.
+            selectedChoiceLists.delete(list);
+
+            processingChoice = true;
+
+            try {
+                try {
+                    await withTimeout(
+                        navigator.clipboard.writeText(questionText),
+                        CLIPBOARD_TIMEOUT_MS,
+                        'clipboard write'
+                    );
+                } catch (error) {
+                    mcqLog(
+                        'could not write the clipboard —',
+                        error?.message ?? error
+                    );
+
+                    console.warn(
+                        'Could not copy the MCQ question text.',
+                        error
+                    );
+
+                    return false;
+                }
+
+                selectedChoiceLists.add(list);
+
+                pendingChoiceList = list;
+
+                tabReturnRetries = 0;
+
+                mcqLog(
+                    'copied question text —',
+                    `${questionText.length} chars`
+                );
+
+                return true;
+            } finally {
+                processingChoice = false;
+            }
+        }
+
+
+        // Runs the copy the first click on a list runs, ignoring that this
+        // list already had its question copied. Only the copy is repeated,
+        // never the choice click: the list stays armed for the answer.
+        async function copyMcqQuestionAgain(list) {
+            hideOverrideMenu();
+
+            if (processingChoice) {
+                mcqLog('a copy is already in progress, ignoring the re-copy');
+
+                return;
+            }
+
+            const questionText = buildMcqQuestionText(list);
+
+            if (!questionText) {
+                mcqLog('could not find question text, not copying');
+
+                return;
+            }
+
+            const copied = await copyMcqQuestionText(
+                list,
+                questionText
+            );
+
+            mcqLog(
+                'right-click re-copy —',
+                copied ? 'copied' : 'failed'
+            );
+        }
+
+
         async function handleChoiceClick(event) {
             mcqLog(
                 'click —',
@@ -2081,25 +2182,15 @@ ${problem}
             // First click on a list: copy the question text instead of
             // selecting anything.
             if (!selectedChoiceLists.has(element)) {
-                const promptText = getMcqText(element);
+                const questionText = buildMcqQuestionText(element);
 
-                if (!promptText.trim()) {
+                if (!questionText) {
                     mcqLog(
                         'could not find question text, letting the click through'
                     );
 
                     return;
                 }
-
-                // The prompt alone does not say what can be chosen, so the
-                // options are copied with it. Without them a question whose
-                // options are images arrives with nothing to answer against.
-                const questionText = [
-                    promptText,
-                    getChoiceListText(element),
-                ]
-                    .filter(Boolean)
-                    .join('\n\n');
 
                 // Synchronous, so the click cannot select an option.
                 event.preventDefault();
@@ -2109,42 +2200,7 @@ ${problem}
                     'cancelled the original click (first click: copying question)'
                 );
 
-                processingChoice = true;
-
-                try {
-                    try {
-                        await withTimeout(
-                            navigator.clipboard.writeText(questionText),
-                            CLIPBOARD_TIMEOUT_MS,
-                            'clipboard write'
-                        );
-                    } catch (error) {
-                        mcqLog(
-                            'could not write the clipboard —',
-                            error?.message ?? error
-                        );
-
-                        console.warn(
-                            'Could not copy the MCQ question text.',
-                            error
-                        );
-
-                        return;
-                    }
-
-                    selectedChoiceLists.add(element);
-
-                    pendingChoiceList = element;
-
-                    tabReturnRetries = 0;
-
-                    mcqLog(
-                        'copied question text —',
-                        `${questionText.length} chars`
-                    );
-                } finally {
-                    processingChoice = false;
-                }
+                await copyMcqQuestionText(element, questionText);
 
                 return;
             }
@@ -2261,6 +2317,45 @@ ${problem}
         }
 
 
+        function createMenuItem(label, onSelect) {
+            const item = document.createElement('button');
+
+            item.type = 'button';
+            item.textContent = label;
+
+            Object.assign(item.style, {
+                display: 'block',
+                width: '100%',
+                padding: '6px 8px',
+                background: 'transparent',
+                color: 'inherit',
+                border: '0',
+                borderRadius: '4px',
+                font: 'inherit',
+                textAlign: 'left',
+                whiteSpace: 'nowrap',
+                cursor: 'pointer',
+            });
+
+            item.addEventListener('click', (clickEvent) => {
+                clickEvent.preventDefault();
+                clickEvent.stopPropagation();
+
+                onSelect();
+            });
+
+            item.addEventListener('mouseenter', () => {
+                item.style.background = '#2f6feb';
+            });
+
+            item.addEventListener('mouseleave', () => {
+                item.style.background = 'transparent';
+            });
+
+            return item;
+        }
+
+
         function showOverrideMenu(event, found) {
             hideOverrideMenu();
 
@@ -2297,41 +2392,19 @@ ${problem}
                 textOverflow: 'ellipsis',
             });
 
-            const item = document.createElement('button');
+            const item = createMenuItem(
+                `Override: click choice #${choice}`,
+                () => clickOptionDirectly(list, choice)
+            );
 
-            item.type = 'button';
-            item.textContent = `Override: click choice #${choice}`;
+            // Same offer the text-based answer fields give on a right-click:
+            // repeat the question copy for when the first one went wrong.
+            const copyItem = createMenuItem(
+                'Copy question again',
+                () => copyMcqQuestionAgain(list)
+            );
 
-            Object.assign(item.style, {
-                display: 'block',
-                width: '100%',
-                padding: '6px 8px',
-                background: 'transparent',
-                color: 'inherit',
-                border: '0',
-                borderRadius: '4px',
-                font: 'inherit',
-                textAlign: 'left',
-                whiteSpace: 'nowrap',
-                cursor: 'pointer',
-            });
-
-            item.addEventListener('click', (clickEvent) => {
-                clickEvent.preventDefault();
-                clickEvent.stopPropagation();
-
-                clickOptionDirectly(list, choice);
-            });
-
-            item.addEventListener('mouseenter', () => {
-                item.style.background = '#2f6feb';
-            });
-
-            item.addEventListener('mouseleave', () => {
-                item.style.background = 'transparent';
-            });
-
-            menu.append(caption, item);
+            menu.append(caption, item, copyItem);
             document.body.appendChild(menu);
 
             // A keyboard-invoked context menu reports no coordinates, so fall
