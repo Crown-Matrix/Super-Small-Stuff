@@ -31,7 +31,8 @@ const displayNoneSelectors = [
   '.trc_rbox_container',
   '#taboola-mid-article-thumbnails',
   '[class*="il-sr-info-native-wrapper"]',
-  '[class*="il-sr-native-wrapper"]'
+  '[class*="il-sr-native-wrapper"]',
+  'sellwild-widget'
 ];
 
 // Selectors to hide with visibility: hidden
